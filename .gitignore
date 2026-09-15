@@ -1,3 +1,8 @@
 .env
+.env.*
 chroma_db/
 __pycache__/
+.venv/
+venv/
+.DS_Store
+.idea/

@@ -1,0 +1,16 @@
+# LangChain core meta-package (pulls in langchain-core, langchain-text-splitters)
+langchain
+# Text splitter used for chunking
+langchain-text-splitters
+# ChromaDB vector store integration for LangChain
+langchain-chroma
+# Gemini chat model + Gemini embeddings for LangChain
+# (this package already bundles the underlying Google GenAI client, so a
+#  separate google-genai dependency is not needed)
+langchain-google-genai
+# Local, on-disk vector database
+chromadb
+# Loads GEMINI_API_KEY from the .env file
+python-dotenv
+# Optional: minimal web UI (run: streamlit run app.py)
+streamlit

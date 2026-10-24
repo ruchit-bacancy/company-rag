@@ -122,16 +122,16 @@ company-rag/
 
 ## Prerequisites
 
-- **Python 3.10–3.13.** (Python 3.14 was too new at time of writing — some
-  dependencies had no prebuilt wheels and failed to compile. If `pip install`
-  fails while building `pandas`/`pkg_resources`, use 3.13. See
-  [Troubleshooting](#troubleshooting).)
+- **Python 3.10–3.14**, built natively for your machine. On an Apple Silicon
+  Mac use an arm64 Python such as Homebrew's `/opt/homebrew/bin/python3` — an
+  Intel (x86_64) Python will not run without Rosetta. See
+  [Troubleshooting](#troubleshooting).
 - **A Gemini API key** from [Google AI Studio](https://aistudio.google.com/app/apikey)
   (the free tier is enough for this demo, with limits — see
   [Troubleshooting](#troubleshooting)).
 
 Tested with LangChain 1.x, `langchain-google-genai` 4.x, `langchain-chroma` 1.x,
-`chromadb` 1.5.x on Python 3.13.
+`chromadb` 1.5.x on Python 3.13 (Intel Mac) and Python 3.14 (Apple Silicon).
 
 ---
 
@@ -140,8 +140,11 @@ Tested with LangChain 1.x, `langchain-google-genai` 4.x, `langchain-chroma` 1.x,
 ### 1. Create and activate a virtual environment
 
 ```bash
-python -m venv .venv
+python3 -m venv .venv
 ```
+
+(On Windows the command is `python -m venv .venv`. Once the environment is
+activated, `python` works on every platform.)
 
 macOS / Linux:
 
@@ -397,15 +400,35 @@ running. Options: wait a minute and retry, space out your questions, or move to 
 paid tier. Note ingestion embeddings and chat generation have separate quotas.
 
 **`pip install` fails building `pandas` / `ModuleNotFoundError: No module named 'pkg_resources'`**
-Your Python is likely too new for prebuilt wheels of a dependency. Use Python
-3.10–3.13:
+A dependency has no prebuilt wheel for your Python version, so pip tried to
+compile it. Recreate the environment with a supported Python (3.10–3.14):
 
 ```bash
 rm -rf .venv
-python3.13 -m venv .venv
+python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 ```
+
+**`bad CPU type in executable` (e.g. after moving from an Intel Mac to Apple Silicon)**
+`.venv` was created with an Intel (x86_64) Python, and its compiled packages are
+Intel builds too. A virtual environment can't be moved between CPU types —
+delete it and rebuild it with a native arm64 Python:
+
+```bash
+rm -rf .venv __pycache__
+/opt/homebrew/bin/python3 -m venv .venv   # Homebrew's arm64 Python
+source .venv/bin/activate
+pip install -r requirements.txt
+```
+
+Your code, `docs/`, `.env` and `chroma_db/` are unaffected — the existing vector
+database works as-is, so there is no need to re-run `ingest.py`.
+
+**`pip install` stops with `Connection interrupted while downloading`**
+The connection dropped mid-download. Re-run the same command (already-downloaded
+files are cached), optionally with more patience:
+`pip install --retries 10 --timeout 60 -r requirements.txt`.
 
 **Answers seem off, or it says "not found" for something that IS in the docs**
 Turn on `DEBUG = True` in `config.py` to inspect what was retrieved and the

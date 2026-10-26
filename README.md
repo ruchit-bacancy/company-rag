@@ -1,17 +1,30 @@
-# Company Policy RAG Chatbot
+# Document Q&A RAG Chatbot
 
-A small, complete, **educational** Retrieval-Augmented Generation (RAG) chatbot.
-It answers questions about a set of dummy company policy documents, from the
-command line or a minimal web UI, using LangChain, Google's Gemini models, and a
-local ChromaDB vector database.
+One Retrieval-Augmented Generation (RAG) chatbot that answers questions about
+several long, complex documents, from the command line or a minimal web UI:
 
-This project is intentionally simple. Every RAG stage is easy to find in the
-source code so you can learn how the pieces fit together.
+| Document | File | What makes it hard |
+|---|---|---|
+| GPO Annual Report FY2018 | `docs/GPO-Anual-report.pdf` | 82 pages, two reports glued together with two page-numbering schemes, 27 financial tables |
+| World Bank Global Economic Prospects, June 2026 | `docs/GEP-Jun-2026.pdf` | 200 pages, chapters, boxes, 42 tables, 90 charts, per-page footnotes |
+| Apple iMac Product Environmental Report (Oct 2024) | `docs/iMac_PER_Oct2024.pdf` | facts hidden in tables, a chart and 19 endnotes |
+| Company policies | `docs/*.md` | the original demo documents |
+
+It uses LangChain, a local ChromaDB vector database, local embedding and
+reranking models, and Google's Gemini for the final answer. Every RAG stage is
+in a small, commented file so you can see how the pieces fit together.
+
+**Built for the Gemini free tier.** The free tier allows only about 20 answers
+per day, so Gemini is used for one thing only: writing the final answer.
+Parsing, embeddings, search and reranking all run locally, and the
+evaluation script measures retrieval without any Gemini calls.
 
 ## Contents
 
 - [What is RAG?](#what-is-rag)
 - [Architecture](#architecture)
+- [How the three tasks are solved](#how-the-three-tasks-are-solved)
+- [Saving Gemini quota](#saving-gemini-quota)
 - [How the code maps to the RAG stages](#how-the-code-maps-to-the-rag-stages)
 - [Project structure](#project-structure)
 - [Prerequisites](#prerequisites)
@@ -19,11 +32,10 @@ source code so you can learn how the pieces fit together.
 - [Ingest documents](#ingest-documents)
 - [Start the chatbot (CLI)](#start-the-chatbot-cli)
 - [Optional: web UI](#optional-web-ui)
-- [Adding your own documents](#adding-your-own-documents)
+- [Evaluate](#evaluate)
 - [Example questions](#example-questions)
-- [Debug mode](#debug-mode)
+- [Adding your own documents](#adding-your-own-documents)
 - [Configuration knobs](#configuration-knobs-configpy)
-- [Models (and how to change them)](#models-and-how-to-change-them)
 - [Troubleshooting](#troubleshooting)
 - [Security](#security)
 - [Notes and limitations](#notes-and-limitations)
@@ -33,69 +45,139 @@ source code so you can learn how the pieces fit together.
 ## What is RAG?
 
 Retrieval-Augmented Generation combines information retrieval with an LLM.
-
-Instead of asking the LLM to answer directly (it does **not** know your private
-company documents), the application first **retrieves** relevant information
-from a knowledge base and then gives that information to the LLM as **context**.
-The LLM then writes an answer grounded in that context.
-
-**Why we need it:** the LLM has never seen our company documents.
-**How it works:** we convert the documents into embeddings and store them in a
-vector database.
-**When a question arrives:** we embed the question and search for similar
-document chunks.
-**Then:** we hand those chunks to Gemini as context.
-**Finally:** Gemini generates a natural-language answer based on that context.
+The LLM has never seen our documents, so instead of asking it directly, the
+application first **retrieves** the most relevant passages from a knowledge
+base and gives them to the LLM as **context**. The LLM then writes an answer
+grounded in those passages. Behind the scenes it cites the document and page
+each fact came from (shown with `DEBUG = True` and in `evaluate.py`).
 
 ---
 
 ## Architecture
 
 ```text
-Documents (docs/*.md)
-   ↓
-Chunking (RecursiveCharacterTextSplitter)
-   ↓
-Gemini Embeddings
-   ↓
-ChromaDB (local, on disk)
-   ↓
-Query
-   ↓
-Similarity Search (top-k)
-   ↓
-Context (retrieved chunks + sources)
-   ↓
-Gemini LLM (grounded prompt)
-   ↓
-Answer + Sources
+INGESTION (python ingest.py, offline, no API calls)
+  docs/*.pdf, docs/*.md
+     ↓  loaders.py: PDF → Markdown per page (PyMuPDF4LLM): headings, tables,
+     ↓  chart labels; headers/footers dropped; printed page numbers;
+     ↓  section paths; captions; footnotes linked to their references
+  structured blocks
+     ↓  ingest.py: section-aware parent/child chunking
+  child chunks (~900 chars, with "document | section" header)
+     ↓  local embedding model (BAAI/bge-small-en-v1.5)
+  ChromaDB (vectors) + chunks.json (for BM25) + parents.json (for context)
+
+QUESTION TIME (python chat.py / streamlit run app.py)
+  question
+     ↓  retrieval.py: semantic search (Chroma) + keyword search (BM25)
+     ↓  merged with Reciprocal Rank Fusion
+     ↓  local cross-encoder reranker re-scores the top 30
+     ↓  "Table 2.12" / "Figure 1.1" / "Box 1.1" named? → fetch it directly
+     ↓  relevance guard: nothing relevant → "not found" (no Gemini call)
+     ↓  each winning chunk → its parent block, up to a 12k-character budget
+  numbered sources [S1] [S2] ...
+     ↓  chat.py: Gemini writes a cited answer (cached on disk)
+  answer (citation markers removed for display)
 ```
 
-- `ingest.py` builds the knowledge base (the top half: documents → ChromaDB).
-- `chat.py` answers questions (the bottom half: query → answer).
-- `app.py` is an optional web UI that reuses `chat.py`'s pipeline.
-- `config.py` holds all the settings both scripts share.
+---
+
+## How the three tasks are solved
+
+### Task 1: a solid baseline (GPO Annual Report)
+
+- **Ingestion:** PDFs are converted page by page to Markdown with
+  [PyMuPDF4LLM](https://pymupdf.readthedocs.io/en/latest/pymupdf4llm/),
+  which keeps headings and tables and drops running headers and footers. A
+  few leftover footer lines are removed because they repeat on many pages.
+- **Page numbers you can find:** the GPO PDF holds two reports with
+  different numbering (PDF page 14 is printed page 12; PDF page 58 is printed
+  page 27). `printed_page_labels()` detects the number printed on every page,
+  so answers cite e.g. "p. 27 (PDF p. 58)".
+- **Chunking, embeddings, retrieval, generation:** see the next sections.
+  `evaluate.py` keeps the original vector-only search as a baseline, so every
+  improvement is measured against it.
+
+### Task 2: long, structured documents (World Bank GEP, 200 pages)
+
+- **Section-aware chunking.** Every block knows its section path, built from
+  the PDF bookmarks (chapters, regions) plus the detected headings, e.g.
+  `Ch. 2 Regional Outlooks > South Asia > Outlook`. Boxes ("BOX 1.1 How much
+  will AI affect global growth?") become their own sections, and
+  "(continued)" pages are merged back in. A chunk never straddles two
+  sections.
+- **Metadata.** Each chunk stores its document, section, content type
+  (text/table/figure), caption, PDF pages and printed pages.
+- **Contextual chunk headers.** Each chunk is embedded with a first line such
+  as `World Bank Global Economic Prospects, June 2026 | Ch. 1 Global Outlook >
+  Major economies > China`, so a sentence like "Growth is projected to
+  decelerate to 4.2 percent" is findable by "China".
+- **Hybrid retrieval and reranking.** Semantic search finds paraphrases; BM25
+  keyword search finds exact names and numbers ("EM7", "Table 1.1"). A
+  cross-encoder then re-scores the merged candidates.
+- **Context management.** Small chunks (~900 chars) are searched, but their
+  larger parent blocks (~3,000 chars of the same section) are sent to Gemini,
+  best first, until a 12,000-character budget is reached.
+- **Text repair.** The report's body font turns the "Th" ligature into a bare
+  "T" ("Te global economy"); `fix_th_ligature()` repairs these words, which
+  matters for keyword search.
+
+### Task 3: tables, charts and footnotes (Apple iMac report)
+
+- **Tables** stay Markdown tables. Long tables are split into row groups that
+  each repeat the caption and header rows, so "India | 7.2 | 7.1 | 7.7 | 6.6"
+  never loses the years its numbers belong to.
+- **Tables and figures by number.** Captions are recognised whether they
+  are headings or bold text, and every piece of a table carries its caption.
+  When a question names an item ("summarise Table 2.12", "what does Figure
+  1.1 show?", "explain Box 1.1"), its chunks are fetched directly by caption
+  or section and always kept. Neither semantic search nor the reranker
+  understands that "2.12" is a label, and without this the bot answered
+  "not found".
+- **Charts** are vector graphics whose labels are real text. The labels are
+  kept as `figure` chunks together with the figure caption and panel titles
+  (e.g. the iMac chart "445 kg baseline → −99 kg → 346 kg"). No images are
+  sent to an AI model, so this costs no quota.
+- **Footnotes and endnotes.** Superscript markers become `[^n]`, and each
+  marker is linked to its note: on the same page (World Bank footnotes, table
+  notes) or in the "Endnotes" section (Apple). The note text is appended to
+  the chunk that references it, so "iMac uses 58 percent less energy than
+  ENERGY STAR[^18]" is retrieved together with endnote 18 and its power
+  consumption table.
+
+---
+
+## Saving Gemini quota
+
+| Where | What we do |
+|---|---|
+| Ingestion | No Gemini calls: PDF parsing and embeddings are local |
+| Search | Local embeddings, BM25 and a local reranker: no API calls |
+| Out-of-scope questions | If the best reranker score is below `MIN_RERANK_SCORE`, the bot answers "not found" without calling Gemini |
+| Answers | At most one Gemini call per question; no chat history is sent; "low" thinking level |
+| Main model down | If `LLM_MODEL` times out, is overloaded or is out of quota, the prompt goes once to `LLM_FALLBACK_MODEL` (Flash-Lite), which has its own free-tier limits |
+| Repeats | Answers are cached in `.cache/answers.json`, keyed by model + full prompt; asking again is free |
+| Evaluation | `evaluate.py` scores retrieval offline; `--answers N` spends at most N calls |
+
+The CLI prints `Gemini calls today: N` after each new answer, and the web UI
+shows it in the sidebar. This counts only this app's calls on this machine.
 
 ---
 
 ## How the code maps to the RAG stages
 
-If you are reading the code to learn RAG, this is where each stage lives:
-
-| RAG stage                      | File       | Function                       |
-|--------------------------------|------------|--------------------------------|
-| 1. Document loading            | `ingest.py`| `load_documents()`             |
-| 2. Chunking                    | `ingest.py`| `split_documents()`            |
-| 3. Embeddings (docs)           | `config.py`| `get_embeddings()`             |
-| 4. Vector storage              | `ingest.py`| `store_chunks()`               |
-| 5. Query embedding + retrieval | `chat.py`  | `retrieve()`                   |
-| 6. Context construction        | `chat.py`  | `build_context()`              |
-| 7. LLM generation              | `chat.py`  | `answer_query()`               |
-| 8. Source attribution          | `chat.py`  | `unique_sources()`             |
-
-The embedding model in `config.py` is used for **both** documents and queries —
-that is essential, because the query and the documents must live in the same
-vector space for similarity search to be meaningful.
+| RAG stage | File | Function |
+|---|---|---|
+| 1. Document loading (PDF + Markdown) | `loaders.py` | `load_pdf()`, `load_markdown()` |
+| 2. Section-aware chunking | `ingest.py` | `chunk_document()` |
+| 3. Embeddings (local) | `config.py` | `get_embeddings()` |
+| 4. Vector + keyword storage | `ingest.py` | `store_chunks()` |
+| 5. Hybrid retrieval | `retrieval.py` | `Retriever.search()` |
+| 6. Reranking | `retrieval.py` | `Retriever.rerank()` |
+| 7. Context construction | `retrieval.py` | `Retriever.build_context()` |
+| 8. LLM generation (+ cache) | `chat.py` | `answer_query()`, `generate()` |
+| 9. Source attribution (debug/eval only) | `chat.py` | `cited_sources()`, `strip_citations()` |
+| 10. Evaluation | `evaluate.py` | `evaluate_mode()` |
 
 ---
 
@@ -103,19 +185,19 @@ vector space for similarity search to be meaningful.
 
 ```text
 company-rag/
-├── docs/                  # the Markdown knowledge base
-│   ├── company.md
-│   ├── leave-policy.md
-│   ├── wfh-policy.md
-│   └── reimbursement.md
-├── config.py              # models, paths, chunk size, top-k, threshold, DEBUG
-├── ingest.py              # load → chunk → embed → store
-├── chat.py                # embed query → retrieve → build context → generate
-├── app.py                 # optional Streamlit web UI (same pipeline as chat.py)
+├── docs/                    # the knowledge base: 3 PDFs + 4 Markdown policies
+├── eval/questions.json      # test questions with expected pages and answers
+├── config.py                # models, paths, chunk sizes, top-k, thresholds
+├── loaders.py               # PDF/Markdown → structured blocks
+├── ingest.py                # blocks → chunks → embeddings → ChromaDB
+├── retrieval.py             # hybrid search → rerank → context
+├── chat.py                  # CLI chatbot + the shared answer pipeline
+├── app.py                   # optional Streamlit web UI
+├── evaluate.py              # retrieval (and optional answer) evaluation
 ├── requirements.txt
-├── .env                   # your GEMINI_API_KEY (git-ignored, never committed)
-├── chroma_db/             # local vector database (created by ingest.py, git-ignored)
-└── README.md
+├── .env                     # your GEMINI_API_KEY (git-ignored)
+├── chroma_db/               # vector DB + chunk files (built by ingest.py, git-ignored)
+└── .cache/                  # local models + answer cache (git-ignored)
 ```
 
 ---
@@ -123,15 +205,14 @@ company-rag/
 ## Prerequisites
 
 - **Python 3.10–3.14**, built natively for your machine. On an Apple Silicon
-  Mac use an arm64 Python such as Homebrew's `/opt/homebrew/bin/python3` — an
-  Intel (x86_64) Python will not run without Rosetta. See
-  [Troubleshooting](#troubleshooting).
-- **A Gemini API key** from [Google AI Studio](https://aistudio.google.com/app/apikey)
-  (the free tier is enough for this demo, with limits — see
-  [Troubleshooting](#troubleshooting)).
+  Mac use an arm64 Python such as Homebrew's `/opt/homebrew/bin/python3`.
+- **A Gemini API key** from [Google AI Studio](https://aistudio.google.com/app/apikey).
+  The free tier is enough; see [Saving Gemini quota](#saving-gemini-quota).
+- About **300 MB of disk** for the local models, downloaded automatically on
+  first use into `.cache/models/`.
 
-Tested with LangChain 1.x, `langchain-google-genai` 4.x, `langchain-chroma` 1.x,
-`chromadb` 1.5.x on Python 3.13 (Intel Mac) and Python 3.14 (Apple Silicon).
+Tested with LangChain 1.x, `langchain-google-genai` 4.x, `chromadb` 1.5.x,
+PyMuPDF 2.0, fastembed 0.9 on Python 3.14 (Apple Silicon).
 
 ---
 
@@ -141,21 +222,7 @@ Tested with LangChain 1.x, `langchain-google-genai` 4.x, `langchain-chroma` 1.x,
 
 ```bash
 python3 -m venv .venv
-```
-
-(On Windows the command is `python -m venv .venv`. Once the environment is
-activated, `python` works on every platform.)
-
-macOS / Linux:
-
-```bash
-source .venv/bin/activate
-```
-
-Windows (PowerShell):
-
-```powershell
-.venv\Scripts\Activate.ps1
+source .venv/bin/activate          # Windows: .venv\Scripts\Activate.ps1
 ```
 
 ### 2. Install dependencies
@@ -166,20 +233,20 @@ pip install -r requirements.txt
 
 ### 3. Configure your API key
 
-Create a file named `.env` in the project root with your Gemini API key:
+Create a file named `.env` in the project root:
 
 ```text
 GEMINI_API_KEY=your_api_key_here
 ```
 
-`.env` is git-ignored, so your key is never committed. It is read with
-`python-dotenv` and is never hardcoded or printed.
+`.env` is git-ignored. Only answer generation needs the key; ingestion,
+search and `evaluate.py` (without `--answers`) work without it.
 
 ---
 
 ## Ingest documents
 
-Build (or rebuild) the vector database:
+Build (or rebuild) the knowledge base:
 
 ```bash
 python ingest.py
@@ -189,26 +256,21 @@ Example output:
 
 ```text
 Loading documents...
-Found:
-  - company.md
-  - leave-policy.md
-  - reimbursement.md
-  - wfh-policy.md
-
-Loaded 4 documents.
-
-Splitting documents...
-Created 11 chunks.
-
-Generating embeddings and storing in ChromaDB...
-
+  - GEP-Jun-2026.pdf: 1348 blocks (1214 text, 44 tables, 90 figures) in 35s
+  - GPO-Anual-report.pdf: 402 blocks (363 text, 27 tables, 12 figures) in 12s
+  - iMac_PER_Oct2024.pdf: 93 blocks (89 text, 3 tables, 1 figures) in 3s
+  ...
+Splitting documents into section-aware chunks...
+  - GEP-Jun-2026.pdf: 1124 chunks in 312 parent blocks
+  ...
+Embedding 1499 chunks locally and storing them in ChromaDB...
 Ingestion completed successfully.
-Stored 11 chunks in ChromaDB (collection: 'company_policies').
 ```
 
-It is safe to run this multiple times — it resets the local collection first, so
-you never accumulate duplicate chunks. (The exact chunk count depends on the
-documents and the splitter settings.)
+It takes a few minutes on a laptop CPU (mostly local embedding) and uses no
+API quota. It is safe to run repeatedly: `chroma_db/` is rebuilt from scratch
+each time. The answer cache in `.cache/` is kept; since its key includes the
+retrieved context, changed documents automatically produce fresh answers.
 
 ---
 
@@ -218,150 +280,138 @@ documents and the splitter settings.)
 python chat.py
 ```
 
-Then ask questions. Type `help` for commands, `exit` or `quit` to leave.
-
-> Run `python ingest.py` **before** the first chat, or you'll see
-> *"vector database not found."*
+Type `help` for commands and topics, `exit` or `quit` to leave.
 
 ---
 
 ## Optional: web UI
 
-A minimal Streamlit interface is included. It is a thin layer over the **same**
-RAG pipeline — it imports and calls `answer_query()` from `chat.py`, so there is
-no duplicated retrieval or generation logic.
-
 ```bash
 streamlit run app.py
 ```
 
-This opens a chat page (default `http://localhost:8501`) that shows each answer,
-its source files, and a collapsible **"Show retrieved chunks"** panel (the chunks
-and their similarity distances) so you can see exactly what retrieval fed to
-Gemini.
-
-To stop the server, press **`Ctrl+C`** in that terminal.
-
-Note: the web UI makes it easy to send many questions quickly — keep the Gemini
-free-tier limits in mind.
+A chat page (default `http://localhost:8501`) shows each answer, and today's
+Gemini call count in the sidebar. To see what retrieval
+found behind an answer, use the CLI with `DEBUG = True` or `python evaluate.py -v`.
+Press `Ctrl+C` in the terminal to stop it.
 
 ---
 
-## Adding your own documents
+## Evaluate
 
-The document loader discovers every `*.md` file in `docs/` automatically, so you
-do not touch any code to extend the knowledge base:
+`eval/questions.json` holds test questions across all documents. Each one
+names the document, the PDF page(s) with the answer and strings the answer
+must contain; a few are out of scope and should be refused.
 
-1. Drop a new Markdown file into `docs/`, e.g. `docs/holiday-policy.md`.
-2. Re-run `python ingest.py` to rebuild the vector database.
-3. Ask away — answers will now cite `holiday-policy.md` when relevant.
+```bash
+python evaluate.py              # compare retrieval set-ups (no Gemini calls)
+python evaluate.py -v           # plus per-question results
+python evaluate.py --answers 3  # also generate 3 real answers (≤ 3 Gemini calls, cached)
+```
 
-Source attribution uses the filename, so give your files clear, descriptive
-names.
+Results on the 32 answerable test questions (top 6 chunks), October 2026:
+
+```text
+set-up     Doc@k  Page@k    MRR   Facts
+vector      100%     88%   0.60     88%     ← original baseline
+hybrid      100%     97%   0.70     97%     ← + BM25 keyword search
+rerank      100%    100%   0.83    100%     ← + cross-encoder + named items (the chatbot)
+
+Relevance guard (MIN_RERANK_SCORE = -4.0):
+  out-of-scope questions rejected: 4/4
+  answerable questions wrongly rejected: 0/32
+```
+
+Out-of-scope questions score about −9 to −10 with the reranker, while
+answerable ones score above −4, apart from questions that name a table or
+figure, which pass because the item is fetched directly. A spot check of real
+answers (`--answers 4` on one question per PDF plus one out-of-scope
+question) passed 4/4 using 3 Gemini calls.
+
+**Using the official sample questions:** add them to `eval/questions.json`
+in the same format (the `pages` are PDF page numbers, as shown in a PDF
+viewer's page box).
 
 ---
 
 ## Example questions
 
-Questions the documents **can** answer:
-
 ```text
-How many paid leaves do employees get?
-Can I work from home on Friday?
-What are the working hours?
-How much can I claim for meals?
-How much internet reimbursement can I get?
-How long does reimbursement take?
-Can I carry unused leave to next year?
-What happens if I take sick leave for more than two days?
+What is the total carbon footprint of the iMac (two ports) with 256GB?
+How much power does the iMac consume in sleep mode at 115V?
+Which standard is used to verify Zero Waste to Landfill at iMac supplier sites?
+What is India's real GDP growth forecast for 2026 in Table 1.1?
+In Box 1.1, what do the two AI productivity scenarios assume?
+How is China's debt measured in the Global Economic Prospects report?
+What were GPO's total assets as of September 30, 2018?
+Which firm audited GPO's FY 2018 financial statements?
+How many paid leaves do employees get per year?
 ```
 
-Semantic search in action — "work remotely" finds the "work from home" policy
-even though the exact words differ:
+Out-of-scope questions are refused, usually without a Gemini call:
 
 ```text
-You: Can I work remotely?
+You: Who won the 2018 FIFA World Cup?
 
-Bot: Yes. Employees who have completed probation can request work from home,
-up to two days per week.
-
-Sources:
-- wfh-policy.md
-```
-
-Questions the documents do **not** cover — the bot does not make anything up:
-
-```text
-You: What is the resignation notice period?
-
-Bot: I couldn't find information about that in the provided company documents.
-
-Sources:
-No relevant source found.
-```
-
-Other out-of-scope questions to try (should not be fabricated):
-
-```text
-Who is the CEO?
-What is the company's stock price?
+Bot: I couldn't find information about that in the provided documents.
 ```
 
 ---
 
-## Debug mode
+## Adding your own documents
 
-Set `DEBUG = True` in `config.py` to print the retrieved chunks and their
-similarity distances before each answer (the web UI always offers this via the
-collapsible "Show retrieved chunks" panel). Example:
-
-```text
-Retrieved context:
-----------------------------
-Source: leave-policy.md  (distance: 0.360)
-Every full-time employee receives 18 paid leaves per calendar year.
-...
-----------------------------
-```
-
-This is the best way to *see* how retrieval drives the answer. Keep it `False`
-for clean CLI output.
+Drop a `.pdf` or `.md` file into `docs/` and re-run `python ingest.py`. To
+show a friendly name instead of the filename, add it to `DOC_TITLES` in
+`config.py`. Scanned PDFs (images without a text layer) are not supported.
 
 ---
 
 ## Configuration knobs (config.py)
 
-| Setting           | Meaning                                              |
-|-------------------|------------------------------------------------------|
-| `EMBEDDING_MODEL` | Gemini embedding model (same for docs and queries)   |
-| `LLM_MODEL`       | Gemini chat model used to write the answer           |
-| `CHUNK_SIZE`      | Characters per chunk (~500)                          |
-| `CHUNK_OVERLAP`   | Overlap between chunks (~50)                          |
-| `TOP_K`           | How many chunks to retrieve (3)                      |
-| `MAX_DISTANCE`    | Relevance guard; larger distance = less relevant     |
-| `DEBUG`           | Show retrieved chunks + distances                    |
+| Setting | Meaning |
+|---|---|
+| `EMBEDDING_MODEL` | Local embedding model (same for documents and questions) |
+| `RERANKER_MODEL` | Local cross-encoder used for reranking |
+| `LLM_MODEL` | Gemini model that writes the answer |
+| `LLM_THINKING_LEVEL` | How much the model reasons first (`"low"`: fast) |
+| `LLM_FALLBACK_MODEL` | Model tried once if `LLM_MODEL` fails |
+| `LLM_TIMEOUT` | Seconds to wait for a model before falling back (30) |
+| `CHUNK_SIZE` / `CHUNK_OVERLAP` | Child chunk size in characters (~900) |
+| `PARENT_SIZE` | Parent block size sent as context (~3,000) |
+| `VECTOR_K` / `BM25_K` | Candidates from each search (30 each) |
+| `RERANK_K` | Candidates re-scored by the reranker (30) |
+| `TOP_K` | Chunks kept after reranking (6) |
+| `MIN_RERANK_SCORE` | Relevance guard; below it, no Gemini call |
+| `MAX_CONTEXT_CHARS` | Context budget per question (12,000 characters) |
+| `INDEX_REFERENCES` | Whether bibliographies are indexed (off) |
+| `DEBUG` | Print retrieved chunks and scores in the CLI |
 
-**Note on the relevance threshold:** `MAX_DISTANCE` is a simple cosine-distance
-cutoff (0 = identical, larger = less similar), not a finely tuned value. If
-relevant questions get rejected or irrelevant ones slip through, turn on `DEBUG`
-to see the actual distances and adjust the number.
+If you change `EMBEDDING_MODEL` or any chunking setting, re-run
+`python ingest.py`. Run `python evaluate.py` after any change to see its effect.
 
 ---
 
-## Models (and how to change them)
+## Troubleshooting
 
-Defaults (in `config.py`):
+**`Error: GEMINI_API_KEY is not configured.`**
+There's no `.env` file, or the variable is misspelled.
 
-- `EMBEDDING_MODEL = "models/gemini-embedding-001"`
-- `LLM_MODEL = "gemini-flash-latest"` (an alias that always points to the current
-  Gemini Flash model, so it keeps working as Google rotates versions)
+**`Error: knowledge base not found. Please run 'python ingest.py' first.`**
+Run `python ingest.py`.
 
-To use different models, edit those two lines. **If you change the embedding
-model, re-run `python ingest.py`** — the stored document vectors and your query
-vectors must come from the same model.
+**"The Gemini free-tier quota is used up for now."**
+Both models hit their free-tier daily or per-minute limit. Wait and retry;
+questions asked before are still answered from the cache, and search keeps
+working.
 
-Not every model name is available on every key/API version. To list the models
-**your** key supports:
+**Answers take 30+ seconds and say "answered by ...-flash-lite"**
+The main model timed out (`504 DEADLINE_EXCEEDED`) and the fallback answered.
+This happens when `gemini-flash-latest` is overloaded on the free tier. If it
+persists, set `LLM_MODEL` to a model that responds (e.g.
+`"gemini-flash-lite-latest"`) to skip the wait.
+
+**`404 ... models/<name> is not found`**
+`LLM_MODEL` isn't available for your key. List the models your key supports:
 
 ```python
 import os
@@ -374,66 +424,27 @@ for m in client.models.list():
     print(m.name, m.supported_actions)
 ```
 
-Look for `embedContent` (embedding models) and `generateContent` (chat models).
+**The first run is slow / downloads files.**
+The local embedding and reranking models (~300 MB) are downloaded once into
+`.cache/models/`.
 
----
+**Answers say "not found" for something that IS in the documents.**
+Run `python evaluate.py -v` or set `DEBUG = True` to see what was retrieved
+and the reranker scores. If good chunks score just below `MIN_RERANK_SCORE`,
+lower it slightly.
 
-## Troubleshooting
-
-**`Error: GEMINI_API_KEY is not configured.`**
-There's no `.env` file, or the variable is misspelled. It must be exactly
-`GEMINI_API_KEY=...` on its own line in a file named `.env` in the project root.
-
-**`Error: vector database not found. Please run 'python ingest.py' first.`**
-The `chroma_db/` folder doesn't exist yet. Run `python ingest.py`.
-
-**`404 ... models/<name> is not found ... or is not supported`**
-The model name in `config.py` isn't available for your key/API version. List the
-models your key supports (see [Models](#models-and-how-to-change-them)) and set
-`EMBEDDING_MODEL` / `LLM_MODEL` to a name from that list. Re-run `ingest.py` if
-you changed the embedding model.
-
-**`429 RESOURCE_EXHAUSTED` / "You exceeded your current quota"**
-You've hit the Gemini **free-tier** limits (there are both per-minute and
-per-day caps, and they can be small). The app handles this gracefully and keeps
-running. Options: wait a minute and retry, space out your questions, or move to a
-paid tier. Note ingestion embeddings and chat generation have separate quotas.
-
-**`pip install` fails building `pandas` / `ModuleNotFoundError: No module named 'pkg_resources'`**
-A dependency has no prebuilt wheel for your Python version, so pip tried to
-compile it. Recreate the environment with a supported Python (3.10–3.14):
-
-```bash
-rm -rf .venv
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-```
-
-**`bad CPU type in executable` (e.g. after moving from an Intel Mac to Apple Silicon)**
-`.venv` was created with an Intel (x86_64) Python, and its compiled packages are
-Intel builds too. A virtual environment can't be moved between CPU types —
-delete it and rebuild it with a native arm64 Python:
+**`bad CPU type in executable`** (after moving from an Intel Mac to Apple Silicon)
+Rebuild the virtual environment with a native arm64 Python:
 
 ```bash
 rm -rf .venv __pycache__
-/opt/homebrew/bin/python3 -m venv .venv   # Homebrew's arm64 Python
+/opt/homebrew/bin/python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-Your code, `docs/`, `.env` and `chroma_db/` are unaffected — the existing vector
-database works as-is, so there is no need to re-run `ingest.py`.
-
 **`pip install` stops with `Connection interrupted while downloading`**
-The connection dropped mid-download. Re-run the same command (already-downloaded
-files are cached), optionally with more patience:
-`pip install --retries 10 --timeout 60 -r requirements.txt`.
-
-**Answers seem off, or it says "not found" for something that IS in the docs**
-Turn on `DEBUG = True` in `config.py` to inspect what was retrieved and the
-distances. If good chunks are being filtered out, raise `MAX_DISTANCE`; if junk
-is getting through, lower it. You can also adjust `CHUNK_SIZE` / `TOP_K`.
+Re-run it, optionally with `--retries 10 --timeout 60`.
 
 ---
 
@@ -441,15 +452,20 @@ is getting through, lower it. You can also adjust `CHUNK_SIZE` / `TOP_K`.
 
 - Never commit your API key. `.env` (and every `.env.*`) is git-ignored.
 - The key is read only via `python-dotenv`; it is never hardcoded or printed.
-- `chroma_db/` is local and git-ignored — it's rebuilt any time from `docs/`.
-- All company data here is **dummy** data for demonstration only.
+- `chroma_db/` and `.cache/` are local and git-ignored.
+- Document text is sent to Gemini only as the context of a question.
 
 ---
 
 ## Notes and limitations
 
-- **No conversation memory:** each question is answered independently (the web UI
-  shows past messages for readability, but they are not sent to Gemini).
-- **No agents / LangGraph / async** — this is a deliberately minimal RAG demo.
-- The relevance threshold is a simple distance cutoff, not a tuned classifier;
-  the grounded prompt is the real safeguard against made-up answers.
+- **No conversation memory:** each question is answered independently, which
+  keeps every question to one Gemini call. Ask follow-ups as full questions.
+- **Charts** are searchable through their labels, captions and notes, not
+  their visual shape. A question like "which line is highest in March?"
+  can't be answered from labels alone.
+- **Table headers** spanning several rows are sometimes garbled by the PDF
+  parser; the data rows and the year row are usually intact.
+- **Licensing:** PyMuPDF is AGPL-3.0 (or commercial). If that matters for
+  your use, pdfplumber (MIT) is an alternative parser.
+- The company policy documents are dummy data for demonstration only.

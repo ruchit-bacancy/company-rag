@@ -4,12 +4,19 @@ langchain
 langchain-text-splitters
 # ChromaDB vector store integration for LangChain
 langchain-chroma
-# Gemini chat model + Gemini embeddings for LangChain
-# (this package already bundles the underlying Google GenAI client, so a
-#  separate google-genai dependency is not needed)
+# Gemini chat model for LangChain (writes the final answers)
 langchain-google-genai
 # Local, on-disk vector database
 chromadb
+# PDF parsing: page-by-page Markdown with headings, tables and chart text
+# (PyMuPDF 2.x bundles pymupdf4llm). Licence: AGPL-3.0 or Artifex commercial.
+pymupdf>=2.0
+# Local embeddings + reranker (ONNX, runs on CPU, no API quota)
+fastembed
+# Stemmer used by keyword search (also installed by fastembed)
+py-rust-stemmers
+# Keyword (BM25) search for hybrid retrieval
+rank-bm25
 # Loads GEMINI_API_KEY from the .env file
 python-dotenv
 # Optional: minimal web UI (run: streamlit run app.py)

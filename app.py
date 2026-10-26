@@ -1,5 +1,5 @@
 """
-app.py — Minimal Streamlit web UI for the Company Policy RAG chatbot.
+app.py — Minimal Streamlit web UI for the multi-document RAG chatbot.
 
 This is a thin PRESENTATION layer over the exact same RAG pipeline used by the
 command-line chat.py. It does not re-implement any retrieval or generation
@@ -14,85 +14,70 @@ Run it with:
 
 import streamlit as st
 
-from chat import connect_to_vectorstore, build_llm, answer_query
+from chat import answer_query, build_llm, calls_today, describe_error, strip_citations
+from retrieval import Retriever
 
-st.set_page_config(page_title="Company Policy RAG Chatbot", page_icon="📄")
+st.set_page_config(page_title="Document Q&A Chatbot", page_icon="📄")
 
 
 # Streamlit reruns this whole script on every interaction. @st.cache_resource
-# builds the vector store + LLM once and reuses them, so we don't reconnect to
-# ChromaDB or recreate the model on every click.
+# loads the knowledge base, the local models and the LLM once and reuses them.
 @st.cache_resource
 def load_pipeline():
-    return connect_to_vectorstore(), build_llm()
+    return Retriever(), build_llm()
 
 
-st.title("📄 Company Policy RAG Chatbot")
-st.caption("Ask about leave, work-from-home, reimbursement, or general company info.")
+st.title("📄 Document Q&A Chatbot")
+st.caption(
+    "Ask about the GPO Annual Report FY2018, the World Bank Global Economic "
+    "Prospects (June 2026), the Apple iMac Environmental Report, or company policies."
+)
 
-# If the API key or the vector database is missing, connect/build raise
+# If the API key or the knowledge base is missing, the loaders raise
 # SystemExit with a friendly message — show it and stop instead of crashing.
 try:
-    vectorstore, llm = load_pipeline()
+    with st.spinner("Loading the knowledge base..."):
+        retriever, llm = load_pipeline()
 except SystemExit as error:
     st.error(str(error))
     st.stop()
 
 # We keep the conversation on screen for readability, but note this is DISPLAY
-# ONLY: each question is still answered independently (no chat history is sent
-# to Gemini), exactly like the CLI.
+# ONLY: each question is answered independently (no chat history is sent to
+# Gemini), which keeps every question to at most one Gemini call.
 if "history" not in st.session_state:
     st.session_state.history = []
 
-# Replay the messages exchanged so far.
 for message in st.session_state.history:
     with st.chat_message(message["role"]):
-        st.markdown(message["content"])
-        if message.get("sources") is not None:
-            if message["sources"]:
-                st.caption("Sources: " + ", ".join(message["sources"]))
-            else:
-                st.caption("Sources: No relevant source found.")
+        # strip_citations also cleans answers stored before markers were removed.
+        st.markdown(strip_citations(message["content"]))
 
-# Chat input pinned to the bottom of the page.
-question = st.chat_input("Ask a question about company policies...")
+question = st.chat_input("Ask a question about the documents...")
 if question:
-    # Show the user's message and remember it.
     with st.chat_message("user"):
         st.markdown(question)
     st.session_state.history.append({"role": "user", "content": question})
 
-    # Run the RAG pipeline and render the answer.
     with st.chat_message("assistant"):
-        with st.spinner("Searching the company documents..."):
+        with st.spinner("Searching the documents..."):
             try:
-                result = answer_query(vectorstore, llm, question)
+                result = answer_query(retriever, llm, question)
             except Exception as error:
-                st.error(f"Could not get a response from Gemini: {error}")
+                st.error(describe_error(error))
                 st.stop()
 
         st.markdown(result["answer"])
+        if result["cached"]:
+            st.caption("Answered from cache: no Gemini call.")
 
-        # Source attribution — comes straight from the retrieved chunk metadata.
-        if result["sources"]:
-            st.caption("Sources: " + ", ".join(result["sources"]))
-        else:
-            st.caption("Sources: No relevant source found.")
+    st.session_state.history.append({"role": "assistant", "content": result["answer"]})
 
-        # A collapsed panel that reveals exactly what RAG retrieved. It stays
-        # tucked away so the answer is clean, but it's one click to inspect the
-        # chunks and their distances — great for learning how retrieval works.
-        with st.expander("Show retrieved chunks"):
-            if not result["chunks"]:
-                st.write("No chunks passed the relevance threshold.")
-            for chunk in result["chunks"]:
-                st.markdown(f"**{chunk['source']}** · distance `{chunk['distance']:.3f}`")
-                st.text(chunk["text"])
-
-    st.session_state.history.append(
-        {
-            "role": "assistant",
-            "content": result["answer"],
-            "sources": result["sources"],
-        }
+# Drawn last, so the counter already includes the question just answered.
+with st.sidebar:
+    st.metric("Gemini calls today", calls_today())
+    st.caption(
+        "The free tier allows only about 20 answers per day. Search runs "
+        "locally; Gemini is called once per new question, never for questions "
+        "the documents don't cover, and repeated questions come from the cache."
     )
